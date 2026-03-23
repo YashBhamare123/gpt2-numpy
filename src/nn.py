@@ -63,14 +63,11 @@ class Linear(GradLayer):
             d_Lb = np.sum(d_Ly, axis=0, keepdims=True)
             self.bias.grad = d_Lb
 
-        self.weight.grad = d_Lw
-
         # we return downstream gradient
         return d_Lx
 
 
 class JacobianSoftmax(Operation):
-
     # x : (B, H, S, D)
     def forward(self, x):
         self.x = x
@@ -94,7 +91,6 @@ class JacobianSoftmax(Operation):
         return out
 
 class Softmax(Operation):
-
     # x : (B H S D)
     def forward(self, x):
         self.x = x
@@ -167,9 +163,76 @@ class PositionalEmbeddings(GradLayer):
         return d_Ly
 
 
-# implement layernorm
+
+# implemented as shown in https://docs.pytorch.org/docs/stable/generated/torch.nn.LayerNorm.html
 class LayerNorm(GradLayer):
-    pass
+    def __init__(self, dim, element_wise_affine = True):
+        params = np.random.uniform(-np.sqrt(6/dim), np.sqrt(6/dim), size = (dim))
+        bias = np.random.uniform(-np.sqrt(6/dim), np.sqrt(6/dim), size = (dim))
+
+        # weight and bias both are common across seq length and batch dim
+        if element_wise_affine:
+            self.weight = GradTensor(params, None)
+            self.bias = GradTensor(bias, None)
+        self.element_wise_affine = element_wise_affine
+        self.dim = dim
+
+    # x : (B N D)
+    def forward(self, x):
+        assert x.shape()[-1] == self.dim 
+        self.x = x
+        mean = np.einsum('...j -> ...', x) / self.dim
+        u = x - np.expand_dims(mean, axis = -1)
+        v = np.einsum('...i -> ...', u**2) / self.dim
+
+        # add a small constant for numerical stability
+        e = 1e-5
+        sd = np.sqrt(v + e)
+
+        # store 1/sd as division is expensive
+        self.inverse_sd = 1/sd
+        out = u / np.expand_dims(sd, axis = -1)
+
+        if (self.element_wise_affine):
+            scaled_out = np.einsum('...i, j -> ...i',out, self.weight.params)
+            out = scaled_out + np.expand_dims(self.bias.params, axis = (0, 1))
+
+        return out
+
+    # simplify the jacobian expr and implement the mem efficient backward pass
+    # d_Ly : (B N D)
+    def backward(self, d_Ly):
+        mean = np.einsum('...j -> ...', self.x) /self.dim
+        u = self.x - np.expand_dims(mean, axis = -1)
+
+        if self.element_wise_affine:
+            d_Lw = np.einsum('...i, ...j -> ...i', u, d_Ly)
+
+            # sum over the batch and seq len dim
+            d_Lw = np.einsum('bnd -> d', d_Lw)
+            self.weight.grad = d_Lw
+
+            d_Lb = np.ones_like(d_Lw)
+            self.bias.grad = d_Lb
+        
+        d = np.einsum('...i, j -> ...i', d_Ly, self.weight.params)
+        mean_d = np.einsum('...i -> ...', d) / self.dim
+        scaled_u = u * self.inverse_sd
+        tmp = scaled_u * np.expand_dims(np.einsum('...i, ...j -> ...', scaled_u, d), axis = -1) / self.dim
+        gradient = self.inverse_sd * (d - np.expand_dims(mean_d, axis = -1) - tmp)
+        return gradient
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 

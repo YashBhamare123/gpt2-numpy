@@ -7,6 +7,7 @@ wheels/
 *.egg-info
 .*
 !.gitignore
+test.py
 
 # Virtual environments
 .venv
