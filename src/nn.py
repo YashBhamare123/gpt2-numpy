@@ -15,7 +15,7 @@ class GradTensor:
         self.grad = grad
 
     def _zero_grad(self):
-        self.grad = np.zeros_like(self.params)
+        self.grad = np.zeros_like(self.params, dtype=np.float32)
 
 class GradLayer(Operation):
     def parameters(self):
@@ -35,9 +35,9 @@ class Linear(GradLayer):
     def __init__(self, in_features, out_features, bias = True):
 
         # He uniform initialization schema
-        params = np.random.uniform(-np.sqrt(6/in_features), np.sqrt(6/in_features), size = (in_features, out_features))
+        params = np.random.uniform(-np.sqrt(6/in_features), np.sqrt(6/in_features), size = (in_features, out_features)).astype(np.float32)
         if bias:
-            bias_ts = np.zeros((in_features, 1))
+            bias_ts = np.zeros((in_features, 1), dtype=np.float32)
             self.bias = GradTensor(bias_ts, None)
         else:
             self.bias = None
@@ -48,9 +48,9 @@ class Linear(GradLayer):
     
     def forward(self, x):
         self.x = x
-        out = x @ self.weight
+        out = x @ self.weight.params
         if self.bias:
-            out += self.bias
+            out += self.bias.params
         
         return out
 
@@ -63,6 +63,7 @@ class Linear(GradLayer):
             d_Lb = np.sum(d_Ly, axis=0, keepdims=True)
             self.bias.grad = d_Lb
 
+        self.weight.grad = d_Lw
         # we return downstream gradient
         return d_Lx
 
@@ -102,8 +103,9 @@ class Softmax(Operation):
     
     # d_Ly : (B H S D)
     def backward(self, d_Ly):
-        const = np.einsum('...i, ...j -> ...', self.s, d_Ly)
-        offset_d_Ly = d_Ly - const
+        const = np.einsum('...i, ...i -> ...', self.s, d_Ly)
+        offset_d_Ly = d_Ly - np.expand_dims(const, axis = -1)
+
         out = np.einsum('...i, ...i -> ...i', self.s, offset_d_Ly)
         return out
 
@@ -111,7 +113,7 @@ class Softmax(Operation):
 class ReLU(Operation):
     def forward(self, x):
         self.x = x
-        out = np.vectorize(lambda a : np.max(a, 0))(x)
+        out = np.maximum(x, 0)
         return out
 
     def backward(self, d_Ly):
@@ -167,8 +169,8 @@ class PositionalEmbeddings(GradLayer):
 # implemented as shown in https://docs.pytorch.org/docs/stable/generated/torch.nn.LayerNorm.html
 class LayerNorm(GradLayer):
     def __init__(self, dim, element_wise_affine = True):
-        params = np.random.uniform(-np.sqrt(6/dim), np.sqrt(6/dim), size = (dim))
-        bias = np.random.uniform(-np.sqrt(6/dim), np.sqrt(6/dim), size = (dim))
+        params = np.random.uniform(-np.sqrt(6/dim), np.sqrt(6/dim), size = (dim)).astype(np.float32)
+        bias = np.random.uniform(-np.sqrt(6/dim), np.sqrt(6/dim), size = (dim)).astype(np.float32)
 
         # weight and bias both are common across seq length and batch dim
         if element_wise_affine:
@@ -179,7 +181,7 @@ class LayerNorm(GradLayer):
 
     # x : (B N D)
     def forward(self, x):
-        assert x.shape()[-1] == self.dim 
+        assert x.shape[-1] == self.dim 
         self.x = x
         mean = np.einsum('...j -> ...', x) / self.dim
         u = x - np.expand_dims(mean, axis = -1)
@@ -190,11 +192,11 @@ class LayerNorm(GradLayer):
         sd = np.sqrt(v + e)
 
         # store 1/sd as division is expensive
-        self.inverse_sd = 1/sd
+        self.inverse_sd = np.expand_dims(1/sd, axis= -1)
         out = u / np.expand_dims(sd, axis = -1)
 
         if (self.element_wise_affine):
-            scaled_out = np.einsum('...i, j -> ...i',out, self.weight.params)
+            scaled_out = np.einsum('...i, i -> ...i',out, self.weight.params)
             out = scaled_out + np.expand_dims(self.bias.params, axis = (0, 1))
 
         return out
@@ -204,32 +206,28 @@ class LayerNorm(GradLayer):
     def backward(self, d_Ly):
         mean = np.einsum('...j -> ...', self.x) /self.dim
         u = self.x - np.expand_dims(mean, axis = -1)
+        scaled_u = u * self.inverse_sd
 
         if self.element_wise_affine:
-            d_Lw = np.einsum('...i, ...j -> ...i', u, d_Ly)
+            d_Lw = np.einsum('...i, ...i -> ...i', scaled_u, d_Ly)
 
             # sum over the batch and seq len dim
-            d_Lw = np.einsum('bnd -> d', d_Lw)
+            d_Lw = np.einsum('bni -> i', d_Lw)
             self.weight.grad = d_Lw
 
-            d_Lb = np.ones_like(d_Lw)
+            d_Lb = np.einsum('bni -> i', d_Ly)
             self.bias.grad = d_Lb
         
-        d = np.einsum('...i, j -> ...i', d_Ly, self.weight.params)
+        d = np.einsum('...i, i -> ...i', d_Ly, self.weight.params)
         mean_d = np.einsum('...i -> ...', d) / self.dim
-        scaled_u = u * self.inverse_sd
-        tmp = scaled_u * np.expand_dims(np.einsum('...i, ...j -> ...', scaled_u, d), axis = -1) / self.dim
+        tmp = scaled_u * np.expand_dims(np.einsum('...i, ...i -> ...', scaled_u, d), axis = -1) / self.dim
         gradient = self.inverse_sd * (d - np.expand_dims(mean_d, axis = -1) - tmp)
         return gradient
 
 
-
-
-
-
-
-
-
+# implement multihead attention next
+class MultiHeadAttention(GradLayer):
+    pass
 
 
 
