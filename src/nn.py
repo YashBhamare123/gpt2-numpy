@@ -37,7 +37,7 @@ class Linear(GradLayer):
         # He uniform initialization schema
         params = np.random.uniform(-np.sqrt(6/in_features), np.sqrt(6/in_features), size = (in_features, out_features)).astype(np.float32)
         if bias:
-            bias_ts = np.zeros((in_features, 1), dtype=np.float32)
+            bias_ts = np.zeros((in_features), dtype=np.float32)
             self.bias = GradTensor(bias_ts, None)
         else:
             self.bias = None
@@ -45,27 +45,34 @@ class Linear(GradLayer):
         # all weights are grad tensors
         self.weight = GradTensor(params, None)
 
-    
+    # x : (... N D)
     def forward(self, x):
         self.x = x
-        out = x @ self.weight.params
+        out = np.einsum('...ij, jk -> ...ik', x, self.weight.params)
         if self.bias:
             out += self.bias.params
         
         return out
-
+    # d_Ly : (... N D)
     def backward(self, d_Ly):
-        d_Lx = d_Ly @ np.transpose(self.weight.params)
-        d_Lw = np.transpose(self.x) @ d_Ly
+        d_Lx = np.einsum('...jk, ik -> ...ji', d_Ly, self.weight.params)
+        d_Lw = np.einsum('...kj, ...ki -> ...ji', self.x, d_Ly)
 
         # update gradient as its not used elsewhere
         if self.bias:
-            d_Lb = np.sum(d_Ly, axis=0, keepdims=True)
-            self.bias.grad = d_Lb
 
+            # flatten the gradient to accumutate it
+            d_Lb = np.reshape(d_Ly, (-1, d_Ly.shape[-1]))
+            d_Lb = np.sum(d_Lb, axis=0, keepdims=True)
+            self.bias.grad = d_Lb
+        
+        d_Lw = np.reshape(d_Lw, (-1, d_Lw.shape[-2], d_Lw.shape[-1]))
+        d_Lw = np.sum(d_Lw, axis = 0, keepdims= True)
         self.weight.grad = d_Lw
+
         # we return downstream gradient
         return d_Lx
+
 
 
 class JacobianSoftmax(Operation):
@@ -91,6 +98,8 @@ class JacobianSoftmax(Operation):
         out = np.einsum("...ij, ...j -> ...i", out, d_Ly)
         return out
 
+
+
 class Softmax(Operation):
     # x : (B H S D)
     def forward(self, x):
@@ -110,6 +119,7 @@ class Softmax(Operation):
         return out
 
 
+
 class ReLU(Operation):
     def forward(self, x):
         self.x = x
@@ -119,6 +129,7 @@ class ReLU(Operation):
     def backward(self, d_Ly):
         jac = np.vectorize(lambda a : 1 if max(a, 0) > 0 else 0)(self.x)
         return np.einsum('...i, ...i -> ...i', d_Ly, jac)
+
 
 
 class Embeddings(GradLayer):
@@ -138,6 +149,7 @@ class Embeddings(GradLayer):
         self.weight.grad = np.zeros_like(self.weight.params)
         np.add.at(self.weight.grad, self.x, d_Ly)
         return None
+
 
 
 # we chose to use learnable positional embeddings here
@@ -201,7 +213,6 @@ class LayerNorm(GradLayer):
 
         return out
 
-    # simplify the jacobian expr and implement the mem efficient backward pass
     # d_Ly : (B N D)
     def backward(self, d_Ly):
         mean = np.einsum('...j -> ...', self.x) /self.dim
@@ -225,9 +236,82 @@ class LayerNorm(GradLayer):
         return gradient
 
 
-# implement multihead attention next
+
+# implement multihead attention
 class MultiHeadAttention(GradLayer):
-    pass
+    def __init__(self, embed_dim, num_heads):
+        
+        assert embed_dim % num_heads == 0, "embed dim is not divisible by num heads"
+        self.query = Linear(embed_dim, embed_dim)
+        self.key = Linear(embed_dim, embed_dim)
+        self.value = Linear(embed_dim, embed_dim)
+
+        self.dim = embed_dim
+        self.num_heads = num_heads
+        self.softmax = Softmax()
+
+    # x : (B N D) -> (B N D)
+    def forward(self, x):
+        B, N, D = x.shape
+        self.x = x
+
+        # multiheads after and before attention are the same thing (tiled matmuls)
+        q = self.query.forward(x)
+        k = self.key.forward(x)
+        v = self.value.forward(x)
+
+        q = np.permute_dims(np.reshape(q, shape = (B, N, self.num_heads, D // self.num_heads)), (0, 2, 1, 3))
+        k = np.permute_dims(np.reshape(k, shape = (B, N, self.num_heads, D // self.num_heads)), (0, 2, 1, 3))
+        v = np.permute_dims(np.reshape(v, shape = (B, N, self.num_heads, D // self.num_heads)), (0, 2, 1, 3))
+
+        self.q = q
+        self.k = k
+
+        qkT = np.einsum('...ij, ...kj -> ...ik', q, k) / np.sqrt(D // self.num_heads)
+        qkT_softmax = self.softmax.forward(qkT)
+
+        self.v = v
+        self.qkT_softmax = qkT_softmax
+
+        delta = np.einsum('...jk, ...ki -> ...ji', qkT_softmax, v)
+        delta = np.reshape(np.permute_dims(delta, (0, 2, 1, 3)), shape = (B, N, D))
+        return delta
+    
+    # d_Ly : (B N D)
+    def backward(self, d_Ly):
+        B, N, D = d_Ly.shape
+
+        # expand upstream gradient across heads
+        d_Ly = np.permute_dims(np.reshape(d_Ly, (B, N, self.num_heads, D // self.num_heads)), (0, 2, 1, 3))
+        
+        d_L_qkT_softmax = np.einsum('...ij, ...kj -> ...ik', d_Ly, self.v)
+        d_L_v = np.einsum('...ij, ...ik -> ...jk', self.qkT_softmax, d_Ly)
+
+        d_L_qkT = self.softmax.backward(d_L_qkT_softmax / np.sqrt(D // self.num_heads))
+
+        d_L_q = np.einsum('...ik, ...kj -> ...ij', d_L_qkT, self.k)
+        d_L_k = np.einsum('...ki, ...kj -> ...ij', d_L_qkT, self.q)
+
+        # remove the head dimension (concat across embed_dim)
+        d_L_q = np.reshape(np.permute_dims(d_L_q, (0, 2, 1, 3)), shape = (B, N, D))
+        d_L_k = np.reshape(np.permute_dims(d_L_k, (0, 2, 1, 3)), shape = (B, N, D))
+        d_L_v = np.reshape(np.permute_dims(d_L_v, (0, 2, 1, 3)), shape = (B, N, D))
+
+        d_Lx_q = self.query.backward(d_L_q)
+        d_Lx_k = self.key.backward(d_L_k)
+        d_Lx_v = self.value.backward(d_L_v)
+
+        # sum the contributions from q, k, v for the downstream gradient
+        d_Lx = d_Lx_q + d_Lx_k + d_Lx_v
+        return d_Lx
+
+
+
+
+
+    
+
+
 
 
 
