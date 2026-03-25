@@ -306,10 +306,30 @@ class MultiHeadAttention(GradLayer):
         return d_Lx
 
 
+class CrossEntropyLoss:
+
+    # x : (B S vocab_size)
+    # labels : (B S 1)
+    def forward(self, x, labels):
+        B, N, vocab_size = x.shape
+        self.x = x
+        self.labels = labels
+        out = np.take_along_axis(x, labels, axis =-1)
+        out = out - np.log(np.expand_dims(np.einsum('...i -> ...', np.exp(x)), axis= -1))
+        out =  - np.einsum('bnd -> d', out) / (B * N)    # d is just 1 here
+        return out
+
+    # no upstream gradient as this is the final gradient layer
+    def backward(self):
+        B, N, V = self.x.shape
+        o = Softmax().forward(self.x)
+        one_hot = np.eye(V)[self.labels.squeeze(-1)]
+        return (o - one_hot) / (B*N)
 
 
 
-    
+
+        
 
 
 
