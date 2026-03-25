@@ -313,15 +313,17 @@ class MultiHeadAttention(GradLayer):
         return d_Lx
 
 
-class Dropout:
+class Dropout(Operation):
     # x : (B N D)
-    def forward(self, x, training : bool = False, p : float = 0.2):
-        self.training = training
+    def __init__(self, p : float = 0.2):
+        self.training = False
         self.p = p
+
+    def forward(self, x):
 
         B, N, D = x.shape
         if self.training:
-            mask = (np.random.random(size = (B, N, D)) > p).astype(np.float32)
+            mask = (np.random.random(size = (B, N, D)) > self.p).astype(np.float32)
             self.mask = mask
 
             # scale the outputs by expected value so that the sum of numbers stays in the same range
@@ -332,13 +334,56 @@ class Dropout:
     # d_Ly : (B N D)
     def backward(self, d_Ly):
 
-        # redundant if but kept for clarity
+        # redundant if, but kept for clarity
         if (self.training):
             gradient = np.einsum('...ij, ...ij -> ...ij', d_Ly, self.mask) * (1/ (1 - self.p))
             return gradient
 
         else:
             return d_Ly
+
+
+# Standard FFN Block
+class FFN(GradLayer):
+    def __init__(self, embed_dim, hidden_dim, dropout : bool = False, p : float = 0.2):
+        self.linear1 = Linear(embed_dim, hidden_dim)
+        self.linear2 = Linear(hidden_dim, embed_dim)
+        self.relu= ReLU()
+        if (dropout):
+            self.dropout1 = Dropout(p)
+            self.dropout2 = Dropout(p)
+        else:
+            self.dropout1 = None
+            self.dropout2 = None
+
+        self.p = p
+
+    def forward(self, x):
+        out = self.linear1.forward(x)       
+        out = self.relu.forward(out)
+
+        if self.dropout1:
+            out = self.dropout1.forward(out)
+        
+        out = self.linear2.forward(out)
+        if self.dropout2:
+            out = self.dropout2.forward(out)
+        
+        return out
+
+
+   def backward(self, d_Ly):
+        if self.dropout2:
+            d_Ly= self.dropout2.backward(d_Ly)
+
+        gradient = self.linear2.backward(d_Ly)
+        
+        if self.dropout1:
+            gradient = self.dropout1.backward(gradient)
+        
+        gradient = self.relu.backward(gradient)
+        gradient = self.linear1.backward(gradient)
+        return gradient
 
 
 class CrossEntropyLoss:
