@@ -239,7 +239,7 @@ class LayerNorm(GradLayer):
 
 # implement multihead attention
 class MultiHeadAttention(GradLayer):
-    def __init__(self, embed_dim, num_heads):
+    def __init__(self, embed_dim, num_heads, max_sequence_len, causal: bool = True):
         
         assert embed_dim % num_heads == 0, "embed dim is not divisible by num heads"
         self.query = Linear(embed_dim, embed_dim)
@@ -249,6 +249,9 @@ class MultiHeadAttention(GradLayer):
         self.dim = embed_dim
         self.num_heads = num_heads
         self.softmax = Softmax()
+
+        self.attention_mask = np.triu(np.full((1, 1, max_sequence_len, max_sequence_len), -np.inf), k = 1)
+        self.causal = causal
 
     # x : (B N D) -> (B N D)
     def forward(self, x):
@@ -268,7 +271,11 @@ class MultiHeadAttention(GradLayer):
         self.k = k
 
         qkT = np.einsum('...ij, ...kj -> ...ik', q, k) / np.sqrt(D // self.num_heads)
+        if (self.causal):
+            qkT = qkT + self.attention_mask[:, :, :N, :N]
+
         qkT_softmax = self.softmax.forward(qkT)
+
 
         self.v = v
         self.qkT_softmax = qkT_softmax
@@ -304,6 +311,34 @@ class MultiHeadAttention(GradLayer):
         # sum the contributions from q, k, v for the downstream gradient
         d_Lx = d_Lx_q + d_Lx_k + d_Lx_v
         return d_Lx
+
+
+class Dropout:
+    # x : (B N D)
+    def forward(self, x, training : bool = False, p : float = 0.2):
+        self.training = training
+        self.p = p
+
+        B, N, D = x.shape
+        if self.training:
+            mask = (np.random.random(size = (B, N, D)) > p).astype(np.float32)
+            self.mask = mask
+
+            # scale the outputs by expected value so that the sum of numbers stays in the same range
+            return np.einsum('...ij, ...ij -> ...ij', x, mask) * (1/ (1 - p))
+        else:
+            return x
+        
+    # d_Ly : (B N D)
+    def backward(self, d_Ly):
+
+        # redundant if but kept for clarity
+        if (self.training):
+            gradient = np.einsum('...ij, ...ij -> ...ij', d_Ly, self.mask) * (1/ (1 - self.p))
+            return gradient
+
+        else:
+            return d_Ly
 
 
 class CrossEntropyLoss:
