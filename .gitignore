@@ -8,6 +8,7 @@ wheels/
 .*
 !.gitignore
 test.py
+*.npz
 
 # Virtual environments
 .venv

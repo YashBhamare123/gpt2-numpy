@@ -327,7 +327,7 @@ class Dropout(Operation):
             self.mask = mask
 
             # scale the outputs by expected value so that the sum of numbers stays in the same range
-            return np.einsum('...ij, ...ij -> ...ij', x, mask) * (1/ (1 - p))
+            return np.einsum('...ij, ...ij -> ...ij', x, mask) * (1/ (1 - self.p))
         else:
             return x
         
@@ -372,7 +372,7 @@ class FFN(GradLayer):
         return out
 
 
-   def backward(self, d_Ly):
+    def backward(self, d_Ly):
         if self.dropout2:
             d_Ly= self.dropout2.backward(d_Ly)
 
@@ -407,10 +407,125 @@ class CrossEntropyLoss:
         return (o - one_hot) / (B*N)
 
 
+# model wrapper
+class Pipeline:
+    def __init__(self):
+        self.layers = {}
+        self.layer_order = []
+
+    def register_module(self, layer, name):
+        self.layers[name] = layer
+        self.layer_order.append(name)
 
 
+    def forward(self, x):
+        for layer_name in self.layer_order:
+            x = self.layers[layer_name].forward(x)
+            print(f'computing layer {layer_name}')
+        return x
+
+
+    def backward(self, d_Ly):
+        for layer_name in self.layer_order:
+            d_Ly = self.layers[layer_name].backward(d_Ly)
+        return d_Ly
+
+
+    def __call__(self, x):
+        return self.forward(x)
+
+
+    # true for training, false for eval
+    def train(self):
+        for layer in self.layers.values():
+            self._set_mode(layer, True)
+
+
+    def eval(self):
+        for layer in self.layers.values():
+            self._set_mode(layer, False)
+
+
+    # recursive helper to set all modes to training
+    def _set_mode(self, layer, mode):
+        for attr_name, attr in layer.__dict__.items():
+            if (attr_name == 'training'):
+                layer.__dict__['training'] = mode
+
+            elif isinstance(attr, GradLayer) or isinstance(attr, Operation):
+                self._set_mode(attr, mode)
+            
+
+    # return all learnable parameters (ie GradTensors)
+    def parameters(self):
+        params = []
+        for layer in self.layers.values():
+            if isinstance(layer, GradLayer):
+                params.extend(layer.parameters())
+            elif isinstance(layer, GradTensor):
+                params.append(layer.params)          
+        return params
+
+
+    def _load_layer(self, state_dict, layer):
+        for attr_name, attr_value in layer.__dict__.items():
+            if isinstance(attr_value, GradLayer):
+                layer.__dict__[attr_name] = self._load_layer(state_dict, attr_value)
+            elif isinstance(attr_value, GradTensor):
+                layer.__dict__[attr_name] = state_dict[attr_name]
         
+        return layer
 
+
+    # load all layers matched by keys in from the state dict
+    def load(self, state_dict):
+        for layer_name, layer_val in self.layers.items():
+            self.layers[layer_name] = self._load_layer(state_dict[layer_name], layer_val)
+        
+        print("Loaded Model Successfully")
+
+
+    def _create_layer_dict(self, layer : GradLayer, prev_name, state_dict : dict) -> dict:
+        for attr_name, attr_value in layer.__dict__.items():
+            if isinstance(attr_value, GradLayer):
+                state_dict = self._create_layer_dict(attr_value, prev_name + "." + attr_name, state_dict)
+            elif isinstance(attr_value, GradTensor):
+                state_dict[prev_name + "." + attr_name] = {
+                    "params" : attr_value.params,
+                    "shape" : attr_value.shape
+                }
+        return state_dict
+
+    # save all layer parameters and shapes
+    def save(self, path : str):
+        state_dict = {}
+        for layer_name, layer_val in self.layers.items():
+            if isinstance(layer_val, GradLayer):
+                state_dict.update(self._create_layer_dict(layer_val, layer_name, state_dict))
+        
+        np.savez(path, **state_dict)
+        print("Saved Model Successfully")
+
+
+if __name__ == "__main__":
+    pipe = Pipeline()
+    linear1 = Linear(20, 40)
+    linear2 = Linear(40, 20)
+    linear3 = Linear(20, 20)
+    attn1 = MultiHeadAttention(16, 2, 100)
+    relu = ReLU()
+
+    pipe.register_module(linear1, 'linear1')
+    pipe.register_module(linear2, 'linear2')
+    pipe.register_module(linear3, 'linear3')
+    pipe.register_module(relu, 'relu')
+    pipe.register_module(attn1, 'attn1')
+
+    # pipe.save('./model.npz')
+
+    data = np.load('model.npz', allow_pickle= True)
+    # print(data.files)
+    print(data['attn1.query.weight'])
 
 
 
