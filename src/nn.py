@@ -403,13 +403,19 @@ class Transformer(GradLayer):
         out = self.linear1.forward(out)
         out = x + out
         out_2 = self.layernorm2.forward(out)
-        out_2 = self.ffn1.forward(out)
+        out_2 = self.ffn1.forward(out_2)
         out = out_2 + out
-        return out_2
+        return out
 
     # backprop thru residual pathway as well
     def backward(self, d_Ly):
-        pass
+        grad_1 = self.ffn1.backward(d_Ly)
+        grad_1 = self.layernorm2.backward(grad_1)
+        grad_2 = self.linear1.backward(d_Ly + grad_1)
+        grad_2 = self.attention1.backward(grad_2)
+        grad_2 = self.layernorm1.backward(grad_2)
+        return d_Ly + grad_2 + grad_1
+        
 
 class CrossEntropyLoss:
 
