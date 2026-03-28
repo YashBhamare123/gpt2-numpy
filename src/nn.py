@@ -1,5 +1,7 @@
 import numpy as np
 
+from utils import create_state_dict
+
 class Operation:
     def forward(self, x):
         raise NotImplementedError
@@ -37,7 +39,7 @@ class Linear(GradLayer):
         # He uniform initialization schema
         params = np.random.uniform(-np.sqrt(6/in_features), np.sqrt(6/in_features), size = (in_features, out_features)).astype(np.float32)
         if bias:
-            bias_ts = np.zeros((in_features), dtype=np.float32)
+            bias_ts = np.zeros((out_features), dtype=np.float32)
             self.bias = GradTensor(bias_ts, None)
         else:
             self.bias = None
@@ -186,6 +188,7 @@ class LayerNorm(GradLayer):
 
         # weight and bias both are common across seq length and batch dim
         if element_wise_affine:
+            
             self.weight = GradTensor(params, None)
             self.bias = GradTensor(bias, None)
         self.element_wise_affine = element_wise_affine
@@ -386,6 +389,28 @@ class FFN(GradLayer):
         return gradient
 
 
+class Transformer(GradLayer):
+    def __init__(self, embed_dim, num_heads, max_sequence_len):
+        self.layernorm1 = LayerNorm(embed_dim)
+        self.linear1 = Linear(embed_dim, embed_dim)
+        self.attention1 = MultiHeadAttention(embed_dim, num_heads, max_sequence_len)
+        self.layernorm2 = LayerNorm(embed_dim)
+        self.ffn1 = FFN(embed_dim, embed_dim * 4)
+
+    def forward(self, x):
+        out = self.layernorm1.forward(x)
+        out = self.attention1.forward(out)
+        out = self.linear1.forward(out)
+        out = x + out
+        out_2 = self.layernorm2.forward(out)
+        out_2 = self.ffn1.forward(out)
+        out = out_2 + out
+        return out_2
+
+    # backprop thru residual pathway as well
+    def backward(self, d_Ly):
+        pass
+
 class CrossEntropyLoss:
 
     # x : (B S vocab_size)
@@ -467,12 +492,14 @@ class Pipeline:
         return params
 
 
-    def _load_layer(self, state_dict, layer):
+    def _load_layer(self, state_dict, layer, prev_name):
         for attr_name, attr_value in layer.__dict__.items():
             if isinstance(attr_value, GradLayer):
-                layer.__dict__[attr_name] = self._load_layer(state_dict, attr_value)
+                layer.__dict__[attr_name] = self._load_layer(state_dict, attr_value, prev_name + '.' + attr_name)
             elif isinstance(attr_value, GradTensor):
-                layer.__dict__[attr_name] = state_dict[attr_name]
+                print(layer.__dict__[attr_name].params.shape)
+                print(state_dict[prev_name + '.' + attr_name]['params'].shape)
+                layer.__dict__[attr_name].params = state_dict[prev_name + '.' + attr_name]['params']
         
         return layer
 
@@ -480,7 +507,7 @@ class Pipeline:
     # load all layers matched by keys in from the state dict
     def load(self, state_dict):
         for layer_name, layer_val in self.layers.items():
-            self.layers[layer_name] = self._load_layer(state_dict[layer_name], layer_val)
+            self.layers[layer_name] = self._load_layer(state_dict, layer_val, layer_name)
         
         print("Loaded Model Successfully")
 
@@ -509,31 +536,34 @@ class Pipeline:
 
 if __name__ == "__main__":
     pipe = Pipeline()
+
+    inp = np.random.uniform(0, 1, (16, 20, 20))
+
     linear1 = Linear(20, 40)
+    dropout1 = Dropout()
     linear2 = Linear(40, 20)
     linear3 = Linear(20, 20)
-    attn1 = MultiHeadAttention(16, 2, 100)
+    attn1 = MultiHeadAttention(20, 2, 100)
     relu = ReLU()
+    ff1 = FFN(20, 40, dropout= True)
 
     pipe.register_module(linear1, 'linear1')
+    pipe.register_module(dropout1, 'dropout1')
     pipe.register_module(linear2, 'linear2')
     pipe.register_module(linear3, 'linear3')
     pipe.register_module(relu, 'relu')
     pipe.register_module(attn1, 'attn1')
+    pipe.register_module(ff1, 'ff1')
 
-    # pipe.save('./model.npz')
+    pipe.save('./model.npz')
 
-    data = np.load('model.npz', allow_pickle= True)
-    # print(data.files)
-    print(data['attn1.query.weight'])
-
-
-
-
+    state_dict = create_state_dict('./model.npz')
+    
+    pipe.load(state_dict)
+    pipe.eval()
 
 
-
-
-
-
+    out = pipe(inp)
+    print(pipe.layers['dropout1'].training)
+    print(pipe.layers['ff1'].dropout2.training)
 
