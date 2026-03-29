@@ -1,4 +1,5 @@
-import numpy as np
+import cupy as np
+import numpy 
 
 from src.utils import create_state_dict
 
