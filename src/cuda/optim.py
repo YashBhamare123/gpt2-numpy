@@ -19,7 +19,12 @@ class Adam():
         for idx, p in enumerate(self.parameters):
             try:
                 if p.grad.shape != p.params.shape:
-                    p.grad = p.grad.squeeze(0)
+                    if p.grad.ndim == p.params.ndim + 1 and p.grad.shape[0] == 1:
+                        p.grad = p.grad.squeeze(0)
+
+                if p.grad.shape != p.params.shape and p.grad.T.shape == p.params.shape:
+                    p.grad = p.grad.T
+
                 assert p.grad.shape == p.params.shape, f"shape dont match in grad: {p.grad.shape} and params : {p.params.shape}"
                 
                 v = self.b2 * self.velocity[idx] + (1 - self.b2) * p.grad * p.grad
@@ -41,5 +46,4 @@ class Adam():
     def zero_grad(self):
         for p in self.parameters:
             p.grad.fill(0)
-
 

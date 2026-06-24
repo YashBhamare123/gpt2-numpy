@@ -41,7 +41,7 @@ class Linear(GradLayer):
         # params = np.random.uniform(-np.sqrt(6/in_features), np.sqrt(6/in_features), size = (in_features, out_features)).astype(np.float32)
 
         # GPT2 Paper Schema
-        params = np.random.normal(0, 0.02, size = (in_features, out_features))
+        params = np.random.normal(0, 0.02, size = (in_features, out_features)).astype(np.float32)
         if bias:
             bias_ts = np.zeros((out_features), dtype=np.float32)
             self.bias = GradTensor(bias_ts, None)
@@ -99,7 +99,7 @@ class JacobianSoftmax(Operation):
         out = - 1 * (s @ np.permute_dims(s, axes = [0, 1, 3, 2]))
 
         # diagonal is Si - SiSi
-        eye = np.eye(self.s.shape[-1])
+        eye = np.eye(self.s.shape[-1], dtype=np.float32)
         out += np.einsum("...i, ij -> ...ij", self.s, eye)
         out = np.einsum("...ij, ...j -> ...i", out, d_Ly)
         return out
@@ -145,7 +145,7 @@ class Embeddings(GradLayer):
 
         # params = np.random.uniform(-np.sqrt(6/vocab_size), np.sqrt(6/vocab_size), size = (vocab_size, embedding_dim))
         # GPT2 Paper Schema
-        params = np.random.normal(0, 0.02, size = (vocab_size, embedding_dim))
+        params = np.random.normal(0, 0.02, size = (vocab_size, embedding_dim)).astype(np.float32)
         self.weight = GradTensor(params, None)
     
     def forward(self, x):
@@ -169,7 +169,7 @@ class PositionalEmbeddings(GradLayer):
         # params = np.random.uniform(-np.sqrt(6/max_seq_length), np.sqrt(6/max_seq_length), size = (max_seq_length, embedding_dim))
 
         # GPT2 Paper Schema
-        params = np.random.normal(0, 0.02, size = (max_seq_length, embedding_dim))
+        params = np.random.normal(0, 0.02, size = (max_seq_length, embedding_dim)).astype(np.float32)
         self.weight = GradTensor(params, None)
     
     # x : (B N D)
@@ -196,7 +196,7 @@ class LayerNorm(GradLayer):
 
 
         # GPT2 Paper Schema
-        params = np.random.normal(0, 0.02, size = (dim))
+        params = np.random.normal(0, 0.02, size = (dim)).astype(np.float32)
         bias = np.zeros_like(params).astype(np.float32)
 
         # weight and bias both are common across seq length and batch dim
@@ -266,7 +266,11 @@ class MultiHeadAttention(GradLayer):
         self.num_heads = num_heads
         self.softmax = Softmax()
 
-        self.attention_mask = np.triu(np.full((1, 1, max_sequence_len, max_sequence_len), -np.inf), k = 1)
+        self.attention_mask = np.triu(
+            np.full((1, 1, max_sequence_len, max_sequence_len), -np.inf, dtype=np.float32),
+            k = 1,
+        )
+        self.attention_scale = np.float32(1 / (embed_dim // num_heads) ** 0.5)
         self.causal = causal
 
     # x : (B N D) -> (B N D)
@@ -279,14 +283,14 @@ class MultiHeadAttention(GradLayer):
         k = self.key.forward(x)
         v = self.value.forward(x)
 
-        q = np.permute_dims(np.reshape(q, shape = (B, N, self.num_heads, D // self.num_heads)), (0, 2, 1, 3))
-        k = np.permute_dims(np.reshape(k, shape = (B, N, self.num_heads, D // self.num_heads)), (0, 2, 1, 3))
-        v = np.permute_dims(np.reshape(v, shape = (B, N, self.num_heads, D // self.num_heads)), (0, 2, 1, 3))
+        q = np.permute_dims(np.reshape(q, (B, N, self.num_heads, D // self.num_heads)), (0, 2, 1, 3))
+        k = np.permute_dims(np.reshape(k, (B, N, self.num_heads, D // self.num_heads)), (0, 2, 1, 3))
+        v = np.permute_dims(np.reshape(v, (B, N, self.num_heads, D // self.num_heads)), (0, 2, 1, 3))
 
         self.q = q
         self.k = k
 
-        qkT = np.einsum('...ij, ...kj -> ...ik', q, k) / np.sqrt(D // self.num_heads)
+        qkT = np.einsum('...ij, ...kj -> ...ik', q, k) * self.attention_scale
         if (self.causal):
             qkT = qkT + self.attention_mask[:, :, :N, :N]
 
@@ -297,7 +301,7 @@ class MultiHeadAttention(GradLayer):
         self.qkT_softmax = qkT_softmax
 
         delta = np.einsum('...jk, ...ki -> ...ji', qkT_softmax, v)
-        delta = np.reshape(np.permute_dims(delta, (0, 2, 1, 3)), shape = (B, N, D))
+        delta = np.reshape(np.permute_dims(delta, (0, 2, 1, 3)), (B, N, D))
         return delta
     
     # d_Ly : (B N D)
@@ -310,15 +314,15 @@ class MultiHeadAttention(GradLayer):
         d_L_qkT_softmax = np.einsum('...ij, ...kj -> ...ik', d_Ly, self.v)
         d_L_v = np.einsum('...ij, ...ik -> ...jk', self.qkT_softmax, d_Ly)
 
-        d_L_qkT = self.softmax.backward(d_L_qkT_softmax / np.sqrt(D // self.num_heads))
+        d_L_qkT = self.softmax.backward(d_L_qkT_softmax * self.attention_scale)
 
         d_L_q = np.einsum('...ik, ...kj -> ...ij', d_L_qkT, self.k)
         d_L_k = np.einsum('...ki, ...kj -> ...ij', d_L_qkT, self.q)
 
         # remove the head dimension (concat across embed_dim)
-        d_L_q = np.reshape(np.permute_dims(d_L_q, (0, 2, 1, 3)), shape = (B, N, D))
-        d_L_k = np.reshape(np.permute_dims(d_L_k, (0, 2, 1, 3)), shape = (B, N, D))
-        d_L_v = np.reshape(np.permute_dims(d_L_v, (0, 2, 1, 3)), shape = (B, N, D))
+        d_L_q = np.reshape(np.permute_dims(d_L_q, (0, 2, 1, 3)), (B, N, D))
+        d_L_k = np.reshape(np.permute_dims(d_L_k, (0, 2, 1, 3)), (B, N, D))
+        d_L_v = np.reshape(np.permute_dims(d_L_v, (0, 2, 1, 3)), (B, N, D))
 
         d_Lx_q = self.query.backward(d_L_q)
         d_Lx_k = self.key.backward(d_L_k)
@@ -448,8 +452,10 @@ class CrossEntropyLoss:
     def backward(self):
         B, N, V = self.x.shape
         o = Softmax().forward(self.x)
-        one_hot = np.eye(V)[self.labels.squeeze(-1)]
-        return (o - one_hot) / (B*N)
+        batch_idx = np.arange(B)[:, None]
+        token_idx = np.arange(N)[None, :]
+        o[batch_idx, token_idx, self.labels.squeeze(-1)] -= 1
+        return o / (B*N)
 
 
 # model wrapper
@@ -466,14 +472,12 @@ class Pipeline:
     def forward(self, x):
         for layer_name in self.layer_order:
             x = self.layers[layer_name].forward(x)
-            print(f'computing {layer_name}')
         return x
 
 
     def backward(self, d_Ly):
         for layer_name in reversed(self.layer_order):
             d_Ly = self.layers[layer_name].backward(d_Ly)
-            print(f"backward {layer_name}")
         return d_Ly
 
 
@@ -518,8 +522,6 @@ class Pipeline:
             if isinstance(attr_value, GradLayer):
                 layer.__dict__[attr_name] = self._load_layer(state_dict, attr_value, prev_name + '.' + attr_name)
             elif isinstance(attr_value, GradTensor):
-                print(layer.__dict__[attr_name].params.shape)
-                print(state_dict[prev_name + '.' + attr_name]['params'].shape)
                 layer.__dict__[attr_name].params = state_dict[prev_name + '.' + attr_name]['params']
         
         return layer
@@ -530,9 +532,6 @@ class Pipeline:
         for layer_name, layer_val in self.layers.items():
             self.layers[layer_name] = self._load_layer(state_dict, layer_val, layer_name)
         
-        print("Loaded Model Successfully")
-
-
     def _create_layer_dict(self, layer : GradLayer, prev_name, state_dict : dict) -> dict:
         for attr_name, attr_value in layer.__dict__.items():
             if isinstance(attr_value, GradLayer):
@@ -552,7 +551,6 @@ class Pipeline:
                 state_dict.update(self._create_layer_dict(layer_val, layer_name, state_dict))
         
         np.savez(path, **state_dict)
-        print("Saved Model Successfully")
 
 
 if __name__ == "__main__":
@@ -587,4 +585,3 @@ if __name__ == "__main__":
     out = pipe(inp)
     print(pipe.layers['dropout1'].training)
     print(pipe.layers['ff1'].dropout2.training)
-

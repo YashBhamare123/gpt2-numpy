@@ -1,30 +1,51 @@
-import cupy as np
+import numpy as np
+import cupy as cp
+import os
+import random
 
 class DataLoader:
-    def __init__(self, dataset: np.ndarray, batch_size: int, max_seq_len: int):
+    def __init__(self, data_dir, batch_size, max_seq_len):
         self.batch_size = batch_size
         self.max_seq_len = max_seq_len
-        usable_len = (len(dataset) - 1) // batch_size * batch_size
-        x = dataset[:usable_len]
-        labels = dataset[1:usable_len + 1]
-        self.x = x.reshape(batch_size, -1)
-        self.labels = labels.reshape(batch_size, -1)
-        self.num_chunks = self.x.shape[1] // max_seq_len
+
+        # load shard paths
+        self.shards = [
+            os.path.join(data_dir, f)
+            for f in os.listdir(data_dir)
+            if f.endswith(".bin")
+        ]
+
+        # memory-map all shards
+        self.data = [
+            np.memmap(shard, dtype=np.uint16, mode='r')
+            for shard in self.shards
+        ]
 
     def __iter__(self):
         return self.get_batch()
 
-    def __len__(self):
-        return self.num_chunks
-
     def get_batch(self):
-        chunk_order = np.random.permutation(self.num_chunks)
-        for chunk_idx in chunk_order:
-            start = chunk_idx * self.max_seq_len
-            end = start + self.max_seq_len
-            x_batch = self.x[:, start:end]
-            label_batch = self.labels[:, start:end]
-            yield self.process(x_batch), self.process(label_batch)
+        while True:
+            x_batch = []
+            y_batch = []
 
-    def process(self, x):
-        return x
+            for _ in range(self.batch_size):
+
+                # pick random shard
+                shard = random.choice(self.data)
+
+                # pick random start
+                idx = random.randint(0, len(shard) - self.max_seq_len - 1)
+
+                x = shard[idx : idx + self.max_seq_len]
+                y = shard[idx + 1 : idx + self.max_seq_len + 1]
+
+                x_batch.append(x)
+                y_batch.append(y)
+
+            # batch on cpu
+            x_batch = np.stack(x_batch)
+            y_batch = np.stack(y_batch)
+
+            # move entire batch at once to gpu
+            yield cp.asarray(x_batch, order='C'), cp.asarray(y_batch, order='C')
